@@ -5,6 +5,7 @@ from urllib.parse import quote_plus
 
 import pandas as pd
 import streamlit as st
+from job_sources import fetch_configured_sources
 
 APP_DIR = __import__("pathlib").Path(__file__).parent
 DB_PATH = APP_DIR / "data" / "jobs.db"
@@ -62,6 +63,14 @@ def connect():
             added_at TEXT NOT NULL
         )
     """)
+    # Safe, additive schema migration for databases created by v1.0.
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+    for column, definition in {
+        "source": "TEXT DEFAULT 'Manual'",
+        "external_id": "TEXT DEFAULT ''",
+    }.items():
+        if column not in existing:
+            conn.execute(f"ALTER TABLE jobs ADD COLUMN {column} {definition}")
     conn.commit()
     return conn
 
@@ -111,7 +120,7 @@ st.set_page_config(page_title="AI Job Search Agent", page_icon="🎯", layout="w
 profile = load_profile()
 conn = connect()
 
-st.title("🎯 AI Job Search Agent")
+st.title("🎯 AI Job Search Agent v2.0")
 st.caption("Personalized for senior DevOps/SRE, cloud platform, platform engineering, and technology leadership roles.")
 with st.sidebar:
     st.header("Your profile")
@@ -122,7 +131,7 @@ with st.sidebar:
     st.info("Matching is explainable keyword-based scoring. Validate each vacancy and tailor claims only to experience you can substantiate.")
     st.caption("Edit profile.json to customize your skills and target roles.")
 
-tabs = st.tabs(["Dashboard", "Find jobs", "Add / score a job", "Application tracker", "Profile & setup"])
+tabs = st.tabs(["Dashboard", "Find jobs", "Discover jobs", "Add / score a job", "Application tracker", "Profile & setup"])
 
 with tabs[0]:
     df = pd.read_sql_query("SELECT * FROM jobs ORDER BY fit_score DESC, added_at DESC", conn)
@@ -134,7 +143,7 @@ with tabs[0]:
     if df.empty:
         st.info("Your tracker is empty. Use **Find jobs** to open targeted searches, then add a vacancy under **Add / score a job**.")
     else:
-        show_cols = ["fit_score", "title", "company", "location", "status", "url", "added_at"]
+        show_cols = ["fit_score", "title", "company", "location", "source", "status", "url", "added_at"]
         st.dataframe(df[show_cols], use_container_width=True, hide_index=True,
                      column_config={"url": st.column_config.LinkColumn("Job link")})
         st.download_button("Export tracker CSV", df.to_csv(index=False).encode("utf-8"),
@@ -159,6 +168,67 @@ with tabs[1]:
     """)
 
 with tabs[2]:
+    st.subheader("Discover jobs from public company career feeds")
+    st.caption("Connect public Greenhouse and Lever job boards. This does not scrape logged-in sites or bypass access controls.")
+    st.markdown("""
+    Add one public board per line using the format below. Use the company's board token/slug, not its full URL:
+    - `greenhouse:company-board-token`
+    - `lever:company-site-slug`
+
+    You can find these identifiers in a company's public careers page URL. Start with companies you are genuinely interested in.
+    """)
+    default_sources = st.session_state.get("source_config", "# Example formats (replace with real board identifiers)\n# greenhouse:acme\n# lever:acme")
+    source_config = st.text_area("Company job boards", value=default_sources, height=130,
+                                 help="Public board identifiers only. This configuration is kept in this browser session.")
+    st.session_state["source_config"] = source_config
+    if st.button("Fetch latest vacancies", type="primary"):
+        with st.spinner("Fetching public company job feeds..."):
+            found, errors = fetch_configured_sources(source_config)
+            for job in found:
+                score, matched, gaps = score_job(job["title"], job["description"], job["location"], profile)
+                job["fit_score"] = score
+                job["matched_skills"] = ", ".join(matched)
+                job["gaps"] = ", ".join(gaps)
+        st.session_state["discovered_jobs"] = found
+        st.session_state["discovery_errors"] = errors
+    discovered = st.session_state.get("discovered_jobs", [])
+    errors = st.session_state.get("discovery_errors", [])
+    for error in errors:
+        st.warning(error)
+    if discovered:
+        new_jobs = [j for j in discovered if not j.get("url") or not conn.execute("SELECT 1 FROM jobs WHERE url=?", (j["url"],)).fetchone()]
+        st.success(f"Found {len(discovered)} vacancies; {len(new_jobs)} appear new to your tracker.")
+        view = pd.DataFrame([{k: j.get(k, "") for k in ["fit_score", "title", "company", "location", "posted_date", "url"]} for j in discovered])
+        st.dataframe(view, use_container_width=True, hide_index=True,
+                     column_config={"url": st.column_config.LinkColumn("Original posting")})
+        if st.button("Save all new vacancies to tracker"):
+            saved = 0
+            seen_urls = set()
+            for job in new_jobs:
+                if not job.get("title"):
+                    continue
+                duplicate = conn.execute("SELECT id FROM jobs WHERE url=? AND url<>''", (job.get("url", ""),)).fetchone() if job.get("url") else None
+                if duplicate or (job.get("url") and job.get("url") in seen_urls):
+                    continue
+                if job.get("url"):
+                    seen_urls.add(job["url"])
+                conn.execute("""INSERT INTO jobs
+                    (title, company, location, work_mode, url, posted_date, description,
+                     fit_score, matched_skills, gaps, status, added_at, source, external_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Saved', ?, ?, ?)""",
+                    (job.get("title", "Untitled"), job.get("company", ""), job.get("location", ""),
+                     job.get("work_mode", ""), job.get("url", ""), job.get("posted_date", ""),
+                     job.get("description", ""), job.get("fit_score", 0), job.get("matched_skills", ""),
+                     job.get("gaps", ""), datetime.now().isoformat(timespec="seconds"),
+                     job.get("source", ""), job.get("external_id", "")))
+                saved += 1
+            conn.commit()
+            st.success(f"Saved {saved} new vacancies. Review them in Application tracker.")
+            st.rerun()
+    else:
+        st.info("Add at least one real public board identifier above, then fetch vacancies. No sample jobs are fabricated.")
+
+with tabs[3]:
     st.subheader("Add a vacancy and calculate a match score")
     with st.form("job_form", clear_on_submit=True):
         title = st.text_input("Job title *")
@@ -192,7 +262,7 @@ with tabs[2]:
                 st.write("**Skills not mentioned (not necessarily missing):**", ", ".join(gaps))
                 st.caption("This score is a triage aid, not a prediction of interview success. The description may omit skills.")
 
-with tabs[3]:
+with tabs[4]:
     st.subheader("Application tracker")
     df = pd.read_sql_query("SELECT * FROM jobs ORDER BY fit_score DESC, added_at DESC", conn)
     if df.empty:
@@ -221,7 +291,7 @@ with tabs[3]:
             conn.commit()
             st.rerun()
 
-with tabs[4]:
+with tabs[5]:
     st.subheader("Profile configuration")
     st.write("The starter profile is stored in `profile.json`. Edit it to reflect your verified skills, preferred roles, and any salary requirements.")
     st.json(profile)

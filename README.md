@@ -72,3 +72,28 @@ Streamlit will print a local URL, usually http://localhost:8501.
 Repository name: `ai-job-search-agent`
 
 Include screenshots of the dashboard, an architecture diagram, tests, and a sample redacted job record. Never commit credentials, private résumé details, or application account tokens.
+
+## Version 2.0 — public job-feed discovery
+
+This version preserves the v1 dashboard and adds a **Discover jobs** tab for public Greenhouse and Lever company career feeds.
+
+1. Install dependencies with `python -m pip install -r requirements.txt`.
+2. Run `python -m streamlit run app.py`.
+3. Open **Discover jobs** and enter one board identifier per line:
+   - `greenhouse:company-board-token`
+   - `lever:company-site-slug`
+4. Click **Fetch latest vacancies**, review the original posting links and scores, then choose **Save all new vacancies to tracker**.
+
+Use identifiers from the company's public career-board URL. The app does not scrape behind logins, bypass restrictions, or submit applications. Feed availability and fields vary by employer. A missing description means the initial keyword score may be incomplete; open and review the original listing.
+
+### Tests
+
+Run connector parsing tests with:
+
+```bash
+python -m unittest test_job_sources.py
+```
+
+### Data and upgrade notes
+
+The app performs additive SQLite schema migration when it starts. Existing v1 records are retained. Newly discovered records include their source and external ID. Back up `data/jobs.db` before major changes.
