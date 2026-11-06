@@ -1,7 +1,7 @@
 import json
 import sqlite3
 from datetime import date, datetime
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlencode
 
 import pandas as pd
 import streamlit as st
@@ -90,37 +90,61 @@ def score_job(title, description, location, profile):
     return score, matched, missing[:8]
 
 def search_links():
+    """Build user-initiated searches on supported job-board web interfaces.
+
+    LinkedIn and Naukri do not provide a generally available public job-search
+    API for this personal-use workflow, so the app opens their own search pages.
+    """
     queries = [
-        "Senior SRE Kubernetes Terraform Hyderabad OR Bengaluru",
-        "Platform Engineering Backstage GitOps Crossplane India",
-        "Lead DevOps Engineer Azure AWS Kubernetes Terraform India",
-        "Cloud Platform Architect Azure AKS Terraform Hyderabad Bengaluru",
-        "SRE Engineering Manager India",
-        "Senior Staff Engineer Site Reliability India remote",
-        "Senior .NET Technical Lead enterprise modernization Hyderabad Bengaluru",
+        "Senior SRE Kubernetes Terraform",
+        "Platform Engineering Backstage GitOps Crossplane",
+        "Lead DevOps Engineer Azure AWS Kubernetes Terraform",
+        "Cloud Platform Architect Azure AKS Terraform",
+        "SRE Engineering Manager",
+        "Senior Staff Engineer Site Reliability",
+        "Senior .NET Technical Lead enterprise modernization",
     ]
-    sources = {
-        "LinkedIn Jobs": "https://www.linkedin.com/jobs/search/?keywords={q}&location=India",
-        "Indeed India": "https://in.indeed.com/jobs?q={q}&l=India",
-        "Naukri": "https://www.naukri.com/{slug}-jobs",
-        "Google Jobs/Search": "https://www.google.com/search?q={q}+jobs",
-    }
+    locations = ["Hyderabad", "Bengaluru", "Remote India"]
     rows = []
     for q in queries:
-        for name, template in sources.items():
-            if name == "Naukri":
-                slug = q.lower().replace(" OR ", "-").replace(" ", "-").replace("/", "-")
-                url = template.format(slug=quote_plus(slug))
-            else:
-                url = template.format(q=quote_plus(q))
-            rows.append({"Search focus": q, "Source": name, "Open search": url})
+        for location in locations:
+            linkedin_url = "https://www.linkedin.com/jobs/search/?" + urlencode(
+                {"keywords": q, "location": location}
+            )
+            naukri_slug = "-".join((q + " jobs in " + location).lower().replace(".net", "dotnet").split())
+            naukri_url = "https://www.naukri.com/" + quote_plus(naukri_slug).replace("+", "-")
+            indeed_url = "https://in.indeed.com/jobs?" + urlencode({"q": q, "l": location})
+            google_url = "https://www.google.com/search?" + urlencode({"q": f'{q} jobs {location}'})
+            for name, url in [("LinkedIn Jobs", linkedin_url), ("Naukri", naukri_url),
+                              ("Indeed India", indeed_url), ("Google Jobs/Search", google_url)]:
+                rows.append({"Search focus": q, "Location": location, "Source": name, "Open search": url})
     return pd.DataFrame(rows)
+
+
+def save_imported_job(conn, title, company, location, work_mode, url, posted_date, description, source, profile):
+    """Score and save a user-provided job listing; never fetches authenticated pages."""
+    title, company, url = title.strip(), company.strip(), url.strip()
+    if not title or not description.strip():
+        return False, "Please provide both a job title and job description."
+    if url:
+        existing = conn.execute("SELECT id FROM jobs WHERE url=? AND url<>''", (url,)).fetchone()
+        if existing:
+            return False, f"This URL is already saved (job ID {existing['id']})."
+    score, matched, gaps = score_job(title, description, location, profile)
+    conn.execute("""INSERT INTO jobs
+        (title, company, location, work_mode, url, posted_date, description,
+         fit_score, matched_skills, gaps, status, added_at, source)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Saved', ?, ?)""",
+        (title, company, location.strip(), work_mode, url, posted_date.strip(), description.strip(),
+         score, ", ".join(matched), ", ".join(gaps), datetime.now().isoformat(timespec="seconds"), source))
+    conn.commit()
+    return True, f"Saved successfully. Initial keyword match: {score}/100."
 
 st.set_page_config(page_title="AI Job Search Agent", page_icon="🎯", layout="wide")
 profile = load_profile()
 conn = connect()
 
-st.title("🎯 AI Job Search Agent v2.0")
+st.title("🎯 AI Job Search Agent v2.1")
 st.caption("Personalized for senior DevOps/SRE, cloud platform, platform engineering, and technology leadership roles.")
 with st.sidebar:
     st.header("Your profile")
@@ -131,7 +155,7 @@ with st.sidebar:
     st.info("Matching is explainable keyword-based scoring. Validate each vacancy and tailor claims only to experience you can substantiate.")
     st.caption("Edit profile.json to customize your skills and target roles.")
 
-tabs = st.tabs(["Dashboard", "Find jobs", "Discover jobs", "Add / score a job", "Application tracker", "Profile & setup"])
+tabs = st.tabs(["Dashboard", "Find jobs", "Discover jobs & import", "Add / score a job", "Application tracker", "Profile & setup"])
 
 with tabs[0]:
     df = pd.read_sql_query("SELECT * FROM jobs ORDER BY fit_score DESC, added_at DESC", conn)
@@ -150,38 +174,40 @@ with tabs[0]:
                            "job_tracker.csv", "text/csv")
 
 with tabs[1]:
-    st.subheader("Targeted job searches")
-    st.write("Open a live search on a job board. Search results can change; verify the original posting, date, and eligibility.")
+    st.subheader("Targeted LinkedIn and Naukri searches")
+    st.write("Choose a role family and location, then open the live search on the job board. The app does not sign in to or scrape either site.")
     links = search_links()
     selected_focus = st.selectbox("Role family", sorted(links["Search focus"].unique()))
-    view = links[links["Search focus"] == selected_focus]
+    selected_location = st.selectbox("Location", ["Hyderabad", "Bengaluru", "Remote India"])
+    view = links[(links["Search focus"] == selected_focus) & (links["Location"] == selected_location)]
     for _, row in view.iterrows():
         st.markdown(f"- [{row['Source']}]({row['Open search']})")
+    st.info("LinkedIn and Naukri do not expose a generally available public job-search API for this personal job-seeker workflow. These links use their own search pages; import promising vacancies below. Official APIs are generally employer/partner integrations or require specific authorization.")
     st.divider()
     st.subheader("Suggested daily search routine")
     st.markdown("""
-    1. Search the highest-priority role families first.
+    1. Search LinkedIn and Naukri for the highest-priority role families.
     2. Prefer direct company career pages and vacancies posted recently.
-    3. Save only unique, open roles and record the original posting URL.
-    4. Score the job description and review the matched skills and gaps.
-    5. Tailor your résumé, then submit the application yourself.
+    3. Open the original vacancy and verify that it is still active.
+    4. Copy the job description into **Discover jobs & import** to score and save it.
+    5. Tailor your résumé and submit the application yourself.
     """)
 
 with tabs[2]:
-    st.subheader("Discover jobs from public company career feeds")
-    st.caption("Connect public Greenhouse and Lever job boards. This does not scrape logged-in sites or bypass access controls.")
+    st.subheader("Discover from public company feeds")
+    st.caption("Greenhouse and Lever provide public company vacancy feeds where enabled. LinkedIn and Naukri searches are opened in their own websites; no general public search API is available for this personal-use app.")
     st.markdown("""
-    Add one public board per line using the format below. Use the company's board token/slug, not its full URL:
+    Configure public company boards, one per line:
     - `greenhouse:company-board-token`
     - `lever:company-site-slug`
 
-    You can find these identifiers in a company's public careers page URL. Start with companies you are genuinely interested in.
+    Use the board identifier from a company's public careers page, not the full URL.
     """)
     default_sources = st.session_state.get("source_config", "# Example formats (replace with real board identifiers)\n# greenhouse:acme\n# lever:acme")
-    source_config = st.text_area("Company job boards", value=default_sources, height=130,
-                                 help="Public board identifiers only. This configuration is kept in this browser session.")
+    source_config = st.text_area("Company job boards", value=default_sources, height=110,
+                                 help="Public board identifiers only. Kept in this browser session.")
     st.session_state["source_config"] = source_config
-    if st.button("Fetch latest vacancies", type="primary"):
+    if st.button("Fetch latest company-feed vacancies", type="primary"):
         with st.spinner("Fetching public company job feeds..."):
             found, errors = fetch_configured_sources(source_config)
             for job in found:
@@ -201,14 +227,11 @@ with tabs[2]:
         view = pd.DataFrame([{k: j.get(k, "") for k in ["fit_score", "title", "company", "location", "posted_date", "url"]} for j in discovered])
         st.dataframe(view, use_container_width=True, hide_index=True,
                      column_config={"url": st.column_config.LinkColumn("Original posting")})
-        if st.button("Save all new vacancies to tracker"):
+        if st.button("Save all new company-feed vacancies"):
             saved = 0
             seen_urls = set()
             for job in new_jobs:
-                if not job.get("title"):
-                    continue
-                duplicate = conn.execute("SELECT id FROM jobs WHERE url=? AND url<>''", (job.get("url", ""),)).fetchone() if job.get("url") else None
-                if duplicate or (job.get("url") and job.get("url") in seen_urls):
+                if not job.get("title") or (job.get("url") and job["url"] in seen_urls):
                     continue
                 if job.get("url"):
                     seen_urls.add(job["url"])
@@ -225,8 +248,27 @@ with tabs[2]:
             conn.commit()
             st.success(f"Saved {saved} new vacancies. Review them in Application tracker.")
             st.rerun()
-    else:
-        st.info("Add at least one real public board identifier above, then fetch vacancies. No sample jobs are fabricated.")
+
+    st.divider()
+    st.subheader("Import a LinkedIn, Naukri or company-career vacancy")
+    st.write("Open a vacancy in your browser, verify it, then paste its details here. The app does not need your job-board password or session cookie.")
+    with st.form("quick_import_form", clear_on_submit=True):
+        import_source = st.selectbox("Source", ["LinkedIn", "Naukri", "Company career page", "Indeed", "Other"])
+        import_title = st.text_input("Job title *")
+        import_company = st.text_input("Company")
+        import_location = st.text_input("Location / work mode", placeholder="Hyderabad / Hybrid or Remote India")
+        import_mode = st.selectbox("Work arrangement", ["Not specified", "On-site", "Hybrid", "Remote"], key="quick_import_mode")
+        import_url = st.text_input("Original job URL")
+        import_posted = st.text_input("Posted date (if known)", placeholder="e.g. 2026-11-05")
+        import_description = st.text_area("Paste job description / responsibilities *", height=190)
+        import_submit = st.form_submit_button("Score and import vacancy")
+    if import_submit:
+        ok, message = save_imported_job(conn, import_title, import_company, import_location,
+                                        import_mode, import_url, import_posted, import_description,
+                                        import_source, profile)
+        (st.success if ok else st.warning)(message)
+        if ok:
+            st.rerun()
 
 with tabs[3]:
     st.subheader("Add a vacancy and calculate a match score")
@@ -251,8 +293,8 @@ with tabs[3]:
             else:
                 conn.execute("""INSERT INTO jobs
                     (title, company, location, work_mode, url, posted_date, description, salary_lpa,
-                     fit_score, matched_skills, gaps, status, added_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Saved', ?)""",
+                     fit_score, matched_skills, gaps, status, added_at, source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Saved', ?, 'Manual')""",
                     (title.strip(), company.strip(), location.strip(), work_mode, url.strip(), posted_date.strip(),
                      description.strip(), salary_lpa if salary_lpa else None, score,
                      ", ".join(matched), ", ".join(gaps), datetime.now().isoformat(timespec="seconds")))
